@@ -1,0 +1,670 @@
+---
+title: "proteomics big work"
+author: "Smutin Daniil"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(limma)
+library(ape)
+library(dendextend)
+library(RColorBrewer)
+library(pvclust)
+library(gplots)
+library(NMF)
+library(vegan)
+library(Biobase)
+library(DT)
+library(ggplot2)
+library(impute)
+library(ggrepel)
+library(ggbeeswarm)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(plotly)
+library(enrichplot)
+library(GOplot)
+library(fgsea)
+```
+
+# Preprocessing
+## Data loading and evaluation
+
+```{r load data}
+df <- read.csv("peaks_data.csv")
+head(df)
+```
+
+### NA duty
+
+NA by genes:
+
+```{r plot NA}
+dfNA <- df[,-c(1:3)] %>%  is.na %>% apply(1, sum)
+dfNA %>% 
+  as.data.frame() %>% 
+  ggplot(aes(.)) +
+  geom_density() +
+  theme_minimal()
+```
+
+NA by samples:
+
+```{r plot NA samples}
+dfNA <- df[,-c(1:3)] %>%  is.na %>% apply(2, sum)
+(dfNA/nrow(df)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("name") %>% 
+  mutate("col" = name %>% str_detect("BT")) %>% 
+  ggplot(aes(x = ., color = col)) +
+  geom_density() + 
+  geom_beeswarm(aes(y = 0)) +
+  theme_minimal()
+```
+
+Pretty normal distributions, but with diffetent modes. It is interesting by itself, and removing samples with big number of NAs will broke normal distribution for normal samples. 
+
+I remove all genes with less than 10 hits in samples to get ~log distr.
+```{r remove NA genes}
+dfNA <- df[,-c(1:3)] %>%  is.na %>% apply(1, sum)
+dfNA <- dfNA < 10
+cat("Removed", sum(!dfNA),"genes")
+df <- df[dfNA,]
+```
+
+And re-plot NA distr for samples
+
+```{r plot NA samples 2}
+dfNA <- df[,-c(1:3)] %>%  is.na %>% apply(2, sum)
+(dfNA/nrow(df)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("name") %>% 
+  mutate("col" = name %>% str_detect("BT")) %>% 
+  ggplot(aes(x = ., color = col)) +
+  geom_density() + 
+  geom_beeswarm(aes(y = 0)) +
+  theme_minimal() +
+  scale_color_discrete("WT")
+```
+
+I remove all samples with NA amount > 0.1, to reduce the noise. It is not obligatory, I think, but so much samples)
+```{r remove samples}
+df <- df[,c(T, T, T, (dfNA/nrow(df))<0.1)] 
+cat("Keep", sum((dfNA/nrow(df))<0.1), "samples")
+```
+
+Let's check sample genes and values distributions
+
+```{r distrs}
+df_long <- df %>% 
+  pivot_longer(cols = -c(1:3), values_to = "val")
+
+ggplot(df_long, aes(log10(val), color = name %>% str_detect("BT"))) +
+  geom_density() +
+  theme_minimal() +
+  facet_wrap(~name) +
+  scale_color_discrete("WT")
+```
+
+Almost all samples have lognormal distributions and high levels, so no will be removed, at least now.
+
+## Data transformations
+### KNN
+because why not
+```{r}
+df_knn <- df[,-c(1:3)] %>% 
+  t %>% 
+  impute.knn(k = 2)
+df_knn <- df_knn$data %>% t
+df_exp <- colnames(df[,-c(1:3)]) %>% str_detect("BT") %>% as.factor()
+
+df_knn %>% 
+  as.data.frame() %>% 
+  cbind(df$Gene_id) %>% 
+  pivot_longer(cols = -(ncol(df_knn) + 1), values_to = "vals") %>% 
+  ggplot(aes(name, x = log10(vals), colour = name %>% str_detect("BT"))) +
+  geom_boxplot(outliers = F) +
+  geom_jitter(size = 0.1, alpha = 0.1) +
+  theme_minimal() +
+  scale_color_discrete("WT")
+```
+
+OK, move on. All NAs now have level of ~ 10^(4)
+
+## Normalization
+```{r}
+df_norm <- (df_knn) %>% 
+  log2 %>% 
+  as.matrix %>% 
+  normalizeQuantiles
+
+df_norm[is.na(df_norm)] <- -1
+df_norm[df_norm < 0] <- min(df_norm[df_norm > 0], na.rm = T)
+
+df_norm %>% 
+  as.data.frame() %>% 
+  cbind(df$Gene_id) %>% 
+  pivot_longer(cols = -(ncol(df_knn) + 1), values_to = "vals") %>% 
+  ggplot(aes(name, x = vals, colour = name %>% str_detect("BT"))) +
+  geom_boxplot(outliers = F) +
+  geom_violin(fill = "transparent") +
+  geom_jitter(size = 0.1, alpha = 0.1) +
+  theme_minimal() +
+  scale_color_discrete("WT")
+```
+
+Same normal distributions, we can move on. They are a bit asymmetric, which could be reduced by using minmaxscaling or smth like this. It might be crucial for PCA/RDA, but not for limma.
+
+# Ordinations
+## RDA
+```{r}
+df_rda <- df_norm %>% 
+  t %>% 
+  rda(scale = T, na.action = na.exclude)
+
+ggplot(data.frame(N = df_rda$CA$eig)) +
+  geom_col(aes(y=N/sum(N), 1:length(N))) +
+  theme_minimal() +
+  xlab("PC") + ylab("% explained")
+```
+
+OK, 1st component is enough powerful, we can use it
+```{r}
+df_scores <- data.frame(df_norm %>% t,
+                        scores(df_rda, display = "sites", 
+                               choices = 1:3, scaling = "sites"))
+
+ggplot(df_scores, aes(x = PC1, y = PC2)) + 
+  geom_point(aes(color = df_exp), alpha = 0.5) +
+  coord_equal() + 
+  theme_bw()  +
+  scale_color_discrete("WT")
+```
+
+While PC1 indicate differences between experimental conditions, PC2 might indicate batch-effect. In theory, samples could be differentiate also by PC2, but next PC are similar for all samples, so we can move on and try to evaluate it per component
+
+```{r}
+scores(df_rda, display = "sites", scaling = "sites", choices = 1:15) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("type") %>% 
+  pivot_longer(cols = -1, names_to = "PC") %>% 
+  mutate(type = str_detect(type, "BT")) %>% 
+  ggplot(aes(x = PC %>% str_remove_all("PC") %>% fct_inseq, y = value, 
+             color = type)) +
+  geom_violin(draw_quantiles = 0.5, fill = "transparent") +
+  geom_beeswarm(size = 0.3) +
+  theme_bw()  +
+  xlab("PC") +
+  scale_color_discrete("WT")
+```
+
+In general, disease samples are more variable according to RDA than wt. 2-4 components indicates mainly differences between them.
+
+## MA plot
+```{r}
+X1 <- df_norm[,colnames(df_norm) %>% str_detect("BT")]
+X2 <- df_norm[,colnames(df_norm) %>% str_detect("BT", negate = T)]
+
+RM <- function(x) rowMeans(x, na.rm = T)
+
+X <- (RM(X1) + RM(X2)) / 2
+Y <- (RM(X1) - RM(X2))
+    # График
+ggplot(data.frame(x=X, y = Y), aes(X,Y)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  geom_smooth(method = "lm") +
+  theme_minimal()
+```
+
+Looks like ~ normally distributed genes. I don't know real batch differences, so it might be better to reduce batch based on 2 PC value. But - not now.
+
+# DGE
+## Preprocessing
+```{r}
+rownames(df_norm) <- df$Accession
+expr_data <- df_norm %>% as.matrix()
+pheno_data <- data.frame(df_exp)
+rownames(pheno_data) <- colnames(df_norm)
+
+pheno_metadata <- data.frame(
+  labelDescription = c("Experimental condition"),
+  row.names=c("Condition"))
+pheno_data <- new("AnnotatedDataFrame",
+                 data = pheno_data,
+                 varMetadata = pheno_metadata)
+
+feature_data <- data.frame(Prot = df$Gene_id)
+rownames(feature_data) <- rownames(expr_data)
+feature_metadata <- data.frame(
+  labelDescription = c("Protain name"),
+  row.names = c("Protain"))
+f_data <- new("AnnotatedDataFrame",
+              data = feature_data,
+              varMetadata = feature_metadata)
+
+exp_set <-
+  ExpressionSet(assayData = expr_data,
+                phenoData = pheno_data,
+                featureData = f_data)
+```
+
+## Fit model
+```{r}
+X <- model.matrix(~ df_exp, pData(exp_set))
+fit <- lmFit(exp_set, design = X, method = "robust", maxit = 1000)
+efit <- eBayes(fit)
+```
+
+### Limma MA
+```{r}
+MA_limma <- function(efit, coef, n = 10, signif = TRUE, fdr = 0.05, lfc = 0, text = TRUE, cex.text = 0.8, col.text = "grey20", main = "MA-plot", xlab = "Average log-expression", ylab = "Expression log-ratio", pch = 19, pch.signif = 21, col = "darkgreen", alpha = 0.3, cex = 0.3, ...){
+  # соотношение и интенсивность
+  R <- efit$coefficients[, coef]
+  I <- efit$Amean
+  # прозрачный цвет
+  col_btransp <- adjustcolor(col, alpha.f = alpha)
+  # график
+  plot(I, R, cex = cex, main = main, pch = pch, xlab = xlab, ylab = ylab, col = col_btransp, ...)
+  abline(h = 0)
+  # отмечаем дифференциально-экспрессируемые белки
+  if(signif){
+    sign <- p.adjust(efit$p.value[, coef], method = "BH") <= fdr
+    large <- abs(efit$coefficients[, coef]) >= lfc
+    points(I[sign & large], R[sign & large], cex = cex*2, col = "orange2", pch = pch.signif)
+  }
+  # подписываем первые n белков с сильнее всего различающейся экспрессией
+  if(text){
+    ord <- order(efit$lods[, coef], decreasing = TRUE)
+    top_n <- ord[1:n]
+    text(I[top_n], R[top_n], labels = efit$genes[top_n, ], pos = 4, cex = cex.text, col = col.text)
+  }
+}
+
+MA_limma(efit, coef = 2, n = 30)
+```
+
+Pretty normal MA plot. I don't now differentially expressed genes there, but they might be crucial for heart valve calcification. Or just a noise)
+
+## Top 100 DGE
+```{r}
+my_list <- topTable(efit, coef = 2, n = 100)
+dif_exp_set <- exp_set[fData(exp_set)$Prot %in% my_list$Prot, ]
+```
+
+## Heatmap
+```{r}
+dat <- as.matrix(exprs(dif_exp_set))
+
+rdat <- rownames(dat) %>% 
+  match(df$Accession)
+
+rownames(dat) <- df$Gene_id[rdat]
+
+pal_blue_red <- colorpanel(75, low = "steelblue", mid = "black", high = "red")
+heatmap.2(dat, col = pal_blue_red, scale = "row", 
+          key = TRUE, symkey = FALSE, 
+          density.info = "none", trace = "none",
+          cexRow = 0.9, cexCol = 1, 
+          keysize = 0.7, 
+          margins = c(6,6), key.par = list(mar = c(7,5,5,5)), 
+          lhei = c(0.2,0.6), lwid = c(0.2,0.6)) %>% try(silent = T)
+```
+
+A bit of cell cycle genes (like CDC42, IAH1) are differentially expressed. Meh.
+
+### MA limma for top genes
+```{r}
+MA_limma(efit, coef = 2, n = 80, text = F, lfc = 1)
+```
+
+## Removing indefferential genes
+```{r}
+topTable(efit, coef = 2)
+numGenes <- nrow(exprs(exp_set))
+full_list <- topTable(efit, number = numGenes)
+full_list <- full_list[full_list$adj.P.Val <= 0.05,]
+
+my_list <- full_list[1:20,]
+dif_exp_set <- exp_set[fData(exp_set)$Prot %in% my_list$Prot, ]
+```
+
+
+## Volcano plot
+```{r}
+ggplot() +
+  geom_point(data = full_list, 
+             aes(logFC, -log10(adj.P.Val), 
+                 color = (abs(logFC) > 1) & (adj.P.Val < .01) ), show.legend = F) +
+  geom_text_repel(data = my_list, 
+             aes(logFC, -log10(adj.P.Val),
+                 label = Prot)) +
+  theme_minimal() +
+  ylab("-log10 of adjusted p value") +
+  scale_color_viridis_d(direction = -1, begin = .3)
+```
+
+Cute volcano-plot)
+
+## Significantly DEG
+```{r}
+# Significant results
+sign_results <- full_list %>% 
+  filter(adj.P.Val < .05)
+
+rownames(sign_results) <- rownames(sign_results) %>% str_remove_all("\\|.*")
+
+sign_results$Prot <- sign_results %>% rownames
+
+# Filter directions
+sign_up <- sign_results %>% filter(logFC > 0)
+sign_dw <- sign_results %>% filter(logFC < 0)
+
+gene_up <- sign_up %>% rownames 
+gene_dw <- sign_dw %>% rownames
+
+cat("Up-regulated in wt:", length(gene_up), "genes")
+cat("Down-regulated in wt:", length(gene_dw), "genes")
+```
+Similar amount of genes are up- and down- regulated
+
+## GO
+### KEGG
+
+```{r}
+KEGG_enrich_dw <- enrichKEGG(gene_dw, organism = "hsa", keyType = "uniprot",
+                             pAdjustMethod = "BH")
+
+KEGG_enrich_up <- enrichKEGG(gene_up, organism = "hsa", keyType = "uniprot",
+                             pAdjustMethod = "BH")
+```
+
+#### Comparison
+```{r plot enrich comparison}
+enrich <-
+  KEGG_enrich_dw@result  %>% 
+    merge(data.frame(type = "dw")) %>% merge("ENSEMBL") %>%
+  
+  rbind(
+  KEGG_enrich_up@result  %>% 
+    merge(data.frame(type = "up")) %>% merge("ENSEMBL"))
+
+enrich$Description <- enrich$Description %>% 
+  fct_reorder(enrich$Count)
+
+gg <- ggplot(enrich, aes(y = Description, x = Count, 
+                   color = -log10(p.adjust))) +
+  geom_point() +
+  facet_grid(~type) +
+  theme_minimal() +
+  xlab("counts") + ylab ("KEGG ID") +
+  theme(axis.text.y = element_blank()) +
+  scale_color_viridis_c(direction = -1)
+
+ggplotly(gg)
+```
+#### Dotplot
+```{r KEGG dotplot dw}
+dotplot(KEGG_enrich_dw)
+```
+```{r KEGG dotplot up}
+dotplot(KEGG_enrich_up)
+```
+
+#### Cnetplot
+```{r KEGG cnetplot dw}
+cnetplot(KEGG_enrich_dw)
+```
+```{r KEGG cnetplot up}
+cnetplot(KEGG_enrich_up)
+```
+
+### GO
+#### MF
+```{r GO MF}
+GO_enrich_dw_CC <- enrichGO(sign_dw %>% rownames, "org.Hs.eg.db", keyType = "UNIPROT", ont = "CC")
+GO_enrich_up_CC <- enrichGO(sign_up %>% rownames, "org.Hs.eg.db", keyType = "UNIPROT", ont = "CC")
+```
+##### Dotplot
+```{r}
+dotplot(GO_enrich_dw_CC, showCategory = 10)
+```
+
+
+```{r}
+dotplot(GO_enrich_up_CC, showCategory = 10)
+```
+
+##### GOplot
+```{r}
+pairwise_termsim(GO_enrich_dw_CC) %>% goplot(showCategory = 2)
+```
+
+```{r}
+pairwise_termsim(GO_enrich_up_CC) %>% goplot()
+```
+
+#### MF
+```{r GO MF 2}
+GO_enrich_dw_MF <- enrichGO(sign_dw %>% rownames, "org.Hs.eg.db", keyType = "UNIPROT", ont = "MF")
+GO_enrich_up_MF <- enrichGO(sign_up %>% rownames, "org.Hs.eg.db", keyType = "UNIPROT", ont = "MF")
+```
+##### Dotplot
+```{r}
+dotplot(GO_enrich_dw_MF, showCategory = 10)
+```
+
+
+```{r}
+dotplot(GO_enrich_up_MF, showCategory = 10)
+```
+
+##### GOplot
+```{r}
+pairwise_termsim(GO_enrich_dw_MF) %>% goplot()
+```
+
+```{r}
+pairwise_termsim(GO_enrich_up_MF) %>% goplot()
+```
+
+#### BP
+```{r GO BP}
+GO_enrich_dw_BP <- enrichGO(sign_dw %>% rownames, "org.Hs.eg.db", keyType = "UNIPROT", ont = "BP")
+GO_enrich_up_BP <- enrichGO(sign_up %>% rownames, "org.Hs.eg.db", keyType = "UNIPROT", ont = "BP")
+```
+
+##### Dotplot
+```{r}
+dotplot(GO_enrich_dw_BP, showCategory = 10)
+```
+
+Similarly to GO by MF, diffrent transcription and RNA processing regulators are upregulated according to BP in wt samples
+
+```{r}
+dotplot(GO_enrich_up_BP, showCategory = 10)
+```
+
+A lot of categories are down-regulated and up-regulate at the same time. So it is obligatory to run GSEA and grouped GO
+
+##### GOplot
+```{r}
+pairwise_termsim(GO_enrich_dw_BP) %>% goplot(showCategory = 2)
+```
+
+MF GOplots are unreadable - almost always.
+
+```{r}
+pairwise_termsim(GO_enrich_up_BP)%>% goplot(showCategory = 3)
+```
+
+#### Full GOplots
+```{r full GO}
+ENM <- function(x0, x, ont, rbd = T){
+  x <- x@result %>% 
+    mutate(ONTOLOGY = ont)
+  if(rbd) x <- rbind(x0, x)
+  return(x)
+}
+
+GO_enrich <-  
+  ENM(x = GO_enrich_dw_BP, ont = "BP", rbd = F) %>% 
+  ENM(GO_enrich_dw_CC, "CC") %>% 
+  ENM(GO_enrich_dw_MF, "MF") %>% 
+  ENM(GO_enrich_up_BP, "BP") %>% 
+  ENM(GO_enrich_up_CC, "CC") %>% 
+  ENM(GO_enrich_up_MF, "MF")
+
+GO_enrich <- data.frame(Category = GO_enrich$ONTOLOGY,
+                        ID = GO_enrich$ID,
+                        Term = GO_enrich$Description,
+                        Genes = GO_enrich$geneID %>% 
+                          str_replace_all("\\/", ", "),
+                        adj_pval = GO_enrich$p.adjust)
+
+GO_prep <- data.frame(ID = sign_results %>% rownames,
+                      logFC = sign_results$logFC)
+
+circ <- circle_dat(GO_enrich, GO_prep)
+circGO <- circ[-which(duplicated(circ$ID)),]
+circGO$term <- fct_reorder(circGO$term, circGO$zscore)
+
+MF3 <- groupGO(sign_dw %>% rownames, OrgDb = "org.Hs.eg.db",
+               keyType = "UNIPROT", level = 3, ont = "MF")@result$ID
+
+BP3 <- groupGO(sign_dw %>% rownames, OrgDb = "org.Hs.eg.db",
+               keyType = "UNIPROT", level = 3, ont = "BP")@result$ID
+
+CC3 <- groupGO(sign_dw %>% rownames, OrgDb = "org.Hs.eg.db",
+               keyType = "UNIPROT", level = 3, ont = "CC")@result$ID
+```
+
+##### GObar
+```{r GO bar}
+gg <- 
+  circGO %>%
+  subset(category == "BP") %>%
+  subset(count > 5) %>%
+  subset(adj_pval < 0.01) %>%
+  ggplot () +
+    geom_col (mapping = aes(y = term, x = zscore, fill = adj_pval)) +
+    ylab ("") +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_line()) +
+  scale_fill_gradient("Adjusted p-value", 
+                      low = "darkblue", high = "cadetblue1")
+
+ggplotly(gg)
+```
+```{r}
+gg <- 
+  circGO %>%
+  subset(category == "MF") %>%
+  subset(count > 5) %>%
+  subset(adj_pval < 0.05) %>%
+  ggplot () +
+    geom_col (mapping = aes(y = term, x = zscore, fill = adj_pval)) +
+    ylab ("") +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_line()) +
+  scale_fill_gradient("Adjusted p-value", 
+                      low = "darkblue", high = "cadetblue1")
+
+ggplotly(gg)
+```
+
+Full plot:
+```{r}
+gg <- 
+  circGO %>%
+  subset(ID %in% c(MF3, BP3, CC3)) %>%
+  ggplot () +
+    geom_col (mapping = aes(y = term, x = zscore, fill = adj_pval)) +
+    ylab ("") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 5),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_line(),
+          legend.position = "bottom",
+          strip.text.y = element_text(angle = 0)) +
+  facet_grid(category~., scales = "free_y", space = "free") +
+  scale_fill_gradient("Adjusted p-value", 
+                      low = "darkblue", high = "cadetblue1")
+ggplotly(gg)
+```
+
+ggplotly breaks a part of aesthetics, but what else)
+
+##### GObubble
+```{r}
+circ %>%
+  subset(ID %in% c(MF3, BP3, CC3)) %>%
+  GOBubble(display = F)
+```
+
+### GSEA
+#### Preparation
+```{r GSEA}
+pathways <- gmtPathways("wikipathways-20240410-gmt-Homo_sapiens.gmt") 
+names(pathways) <- names(pathways) %>%
+  str_remove_all("\\%W.*")
+
+nr <- sign_results %>% 
+  rownames %>% 
+  bitr(fromType = "UNIPROT", toType = "ENTREZID", OrgDb = org.Hs.eg.db) %>% 
+  subset(!duplicated("ENTREZID"))
+
+nr <- sign_results %>% 
+  rownames_to_column("UNIPROT") %>% 
+  left_join(nr)
+
+NR <- c(nr$logFC)
+names(NR) <- nr$ENTREZID
+
+fgsea_results <- fgseaMultilevel(pathways, NR)
+
+head(fgsea_results[order(pval), ])
+```
+
+#### GSEA table
+```{r}
+topPathwaysUp <- fgsea_results[ES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- fgsea_results[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(pathways[topPathways], NR, fgsea_results, 
+                     gseaParam=0.5)
+```
+
+#### GO GSEA
+```{r GO GSEA}
+GO_gsea <- gseGO(NR[order(NR, decreasing = T)], 
+                 ont = "ALL", "org.Hs.eg.db", eps = 0)
+```
+
+#### Ridgeplot
+```{r ridgeplot}
+ridgeplot(GO_gsea)
+```
+
+# Discussion
+The basic GO gives similar results for both lines. Cellular localization and biological processes do not differ in general. A rare difference is the down-regulation of aerobic respiratory processes compared to the control. But the group GO plots already show clear differences. 
+
+Only a small group of GO-determining genes appears to be differentially up-regulated significantly. These are genes responsible for myosin binding - probably because they compared specifically cardiac tissue of sick people, with the normal level, where myogenesis processes are less intensified. Similarly, up-regulated adrenergic receptor genes may be a consequence of treatment.
+
+On the other hand, the number of down-regulated genes determining GO compared to controls is high. These are genes responsible for different stages of gene expression, metabolic activity, aerobic respiration and many other processes, judging by all simply are indicators of the deplorable state of the tissue.
+
+GSEA shows that normal processes in cardiac tissue are down-regulated compared to controls. The cell cycle is slower. The cytoskeleton, including the muscle-specific cytoskeleton, works worse. On the contrary, fatty acid transporters, apparently activated in connective tissue cells, and ferroptosis processes are activated. There is an active response to oxidative stress, the work of cyclooxygenase pathway.
+
+It all looks like symptoms of a heart attack or some such oxygen deprivation coupled with hemorrhaging. The cause must be in there somewhere).
